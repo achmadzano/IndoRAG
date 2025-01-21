@@ -155,11 +155,17 @@ with st.sidebar:
             uploaded_file = st.file_uploader("Upload additional `.pdf` file to this collection", type="pdf")
 
             if uploaded_file:
-                with st.spinner("Adding document to the existing collection..."):
-                    updated_engine = index_documents(uploaded_file, selected_collection)
-                    if updated_engine:
-                        st.session_state.file_cache[f"{session_id}-{selected_collection}"] = updated_engine
-                        st.success(f"Successfully added the document to collection: {selected_collection}!")
+                # Display a button for uploading the file to the selected collection
+                if st.button("Upload Document to Existing Collection"):
+                    if selected_collection:
+                        with st.spinner("Adding document to the existing collection..."):
+                            updated_engine = index_documents(uploaded_file, selected_collection)
+                            if updated_engine:
+                                st.session_state.file_cache[f"{session_id}-{selected_collection}"] = updated_engine
+                                st.success(f"Successfully added the document to collection: {selected_collection}!")
+                    else:
+                        st.warning("Please select a collection before uploading a file.")
+
         else:
             st.warning("No collections found. Please create a new collection.")
 
@@ -173,8 +179,7 @@ with st.sidebar:
 
         if uploaded_file:
             st.session_state.uploaded_file = uploaded_file
-            # display_pdf(uploaded_file)
-        
+            
         if new_collection_name and new_collection_name not in existing_collections and uploaded_file:
             if st.button("Start Uploading"):
                 with st.spinner("Uploading documents..."):
@@ -186,6 +191,7 @@ with st.sidebar:
                         st.session_state.selected_collection = new_collection_name
                         st.success("Successfully uploaded your documents and ready to chat!")
                         reset_chat()
+
 
 
 # Rest of the chat interface code

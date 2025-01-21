@@ -15,7 +15,7 @@ def batch_iterate(lst, batch_size):
 
 class EmbedData:
 
-    def __init__(self, embed_model_name="BAAI/bge-m3", batch_size = 32):
+    def __init__(self, embed_model_name="BAAI/bge-m3", batch_size = 512):
         self.embed_model_name = embed_model_name
         self.embed_model = self._load_embed_model()
         self.batch_size = batch_size
@@ -54,7 +54,7 @@ class QdrantVDB_QB:
             self.client.create_collection(collection_name=f"{self.collection_name}",
                                           
                                           vectors_config=models.VectorParams(size=self.vector_dim,
-                                                                             distance=models.Distance.DOT,
+                                                                             distance=models.Distance.EUCLID,
                                                                              on_disk=True),
                                           
                                           optimizers_config=models.OptimizersConfigDiff(default_segment_number=5,
