@@ -1,243 +1,210 @@
-import os
-import base64
-import gc
-import random
-import tempfile
-import time
-import uuid
-from typing import Optional
-
-from IPython.display import Markdown, display
-from dotenv import load_dotenv
-from llama_index.core import SimpleDirectoryReader
-from rag_code import EmbedData, QdrantVDB_QB, Retriever, RAG
 import streamlit as st
-from qdrant_client import QdrantClient
+from pymilvus import Collection, connections
+from sentence_transformers import SentenceTransformer
+from transformers import AutoTokenizer, AutoModelForMaskedLM
+import torch
+import os
+import json
+from langchain_sambanova import ChatSambaNovaCloud
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import PromptTemplate
+import getpass
 
-if "id" not in st.session_state:
-    st.session_state.id = uuid.uuid4()
-    st.session_state.file_cache = {}
-    st.session_state.selected_collection = None
-    st.session_state.uploaded_file = None
-    st.session_state.new_collection_name = None
+st.set_page_config(
+    page_title="Document QnA System",
+    page_icon="🤖",
+    layout="wide"
+)
 
+# Milvus connection details
+milvus_host = "localhost"
+milvus_port = "19530"
+collection_name = "zanobab123"
 
-session_id = st.session_state.id
-batch_size = 32
+# Initialize models in session state
+if 'models_loaded' not in st.session_state:
+    st.session_state.models_loaded = False
 
-load_dotenv()
+@st.cache_resource
+def load_models(dense_model_id='intfloat/multilingual-e5-large-instruct',
+                sparse_model_id='naver/splade-cocondenser-ensembledistil'):
+    """Initialize models once and cache them using Streamlit's cache_resource"""
+    dense_model = SentenceTransformer(dense_model_id)
+    sparse_model = AutoModelForMaskedLM.from_pretrained(sparse_model_id)
+    tokenizer = AutoTokenizer.from_pretrained(sparse_model_id)
+    return dense_model, sparse_model, tokenizer
 
-def get_existing_collections() -> list:
-    """Retrieve list of existing collections from Qdrant."""
+# Hybrid search function
+def hybrid_search(user_question: str, dense_model, sparse_model, tokenizer, alpha: float = 0.6, limit: int = 3):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    sparse_model.to(device)
+    
+    dense_embedding = dense_model.encode(
+        user_question,
+        show_progress_bar=False,
+        convert_to_tensor=True,
+        device=device
+    ).cpu().tolist()
+
+    inputs = tokenizer(user_question, return_tensors="pt", padding=True, truncation=True)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    
+    with torch.no_grad():
+        logits = sparse_model(**inputs).logits
+        relu_log = torch.log1p(torch.relu(logits))
+        sparse_embedding = relu_log.max(dim=1).values.squeeze().cpu()
+
+    indices = torch.nonzero(sparse_embedding > 0).squeeze().tolist()
+    values = sparse_embedding[sparse_embedding > 0].tolist()
+    sparse_dict = dict(zip(indices, values))
+
+    collection = Collection(name=collection_name, using="default")
+    collection.load()
+
     try:
-        client = QdrantClient("localhost", port=6333)
-        collections = client.get_collections().collections
-        return [collection.name for collection in collections]
-    except Exception as e:
-        st.error(f"Error connecting to Qdrant: {e}")
-        return []
-
-def initialize_existing_collection(collection_name: str) -> Optional[RAG]:
-    """Initialize RAG system with existing collection."""
-    try:
-        client = QdrantClient("localhost", port=6333)
-        collection_info = client.get_collection(collection_name)
+        search_params = {
+            "metric_type": "L2",
+            "params": {"nprobe": 10}
+        }
         
-        # Check if collection has any points
-        collection_stats = client.get_collection(collection_name)
-        if collection_stats.points_count == 0:
-            st.error(f"Collection '{collection_name}' is empty. Please create a new collection with documents.")
-            return None
-            
-        embeddata = EmbedData(embed_model_name="BAAI/bge-m3", batch_size=batch_size)
-        
-        qdrant_vdb = QdrantVDB_QB(
-            collection_name=collection_name,
-            batch_size=batch_size,
-            vector_dim=1024
+        results = collection.search(
+            data=[dense_embedding],
+            anns_field="dense_vector",
+            param=search_params,
+            limit=limit,
+            output_fields=["id", "document_id", "metadata_json", "embedding_raw"],
+            consistency_level="Eventually"
         )
-        qdrant_vdb.define_client()
+
+        hits = results[0]
+        final_results = collection.query(
+            expr=f"id in {[hit.id for hit in hits]}",
+            output_fields=["id", "document_id", "metadata_json", "embedding_raw"],
+            consistency_level="Eventually"
+        )
         
-        retriever = Retriever(vector_db=qdrant_vdb, embeddata=embeddata)
-        query_engine = RAG(retriever=retriever, llm_name="Meta-Llama-3.3-70B-Instruct")
+        for result in final_results:
+            for hit in hits:
+                if hit.id == result["id"]:
+                    result["search_score"] = hit.score
+                    break
         
-        return query_engine
-    except Exception as e:
-        st.error(f"Error initializing collection: {e}")
-        return None
+        return final_results
 
-def reset_chat():
-    st.session_state.messages = []
-    st.session_state.context = None
-    gc.collect()
+    finally:
+        collection.release()
 
-def display_pdf(file):
-    st.markdown("### PDF Preview")
-    base64_pdf = base64.b64encode(file.read()).decode("utf-8")
-    pdf_display = f"""<iframe src="data:application/pdf;base64,{base64_pdf}" width="400" height="100%" type="application/pdf"
-                        style="height:100vh; width:100%">
-                    </iframe>"""
-    st.markdown(pdf_display, unsafe_allow_html=True)
+# Process question with SambaNova
+def process_question(user_question: str, data):
+    if not os.getenv("SAMBANOVA_API_KEY"):
+        os.environ["SAMBANOVA_API_KEY"] = getpass.getpass("Enter your SambaNova Cloud API key: ")
 
-def index_documents(uploaded_file, new_collection_name):
-    """Index documents into a new collection."""
-    try:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            file_path = os.path.join(temp_dir, uploaded_file.name)
-            
-            with open(file_path, "wb") as f:
-                f.write(uploaded_file.getvalue())
-            
-            file_key = f"{session_id}-{new_collection_name}"
-            
-            if os.path.exists(temp_dir):
-                loader = SimpleDirectoryReader(
-                    input_dir=temp_dir,
-                    required_exts=[".pdf"],
-                    recursive=True
-                )
-            else:    
-                st.error('Could not find the file you uploaded, please check again...')
-                return None
-            
-            docs = loader.load_data()
-            documents = [doc.text for doc in docs]
-
-            embeddata = EmbedData(embed_model_name="BAAI/bge-m3", batch_size=batch_size)
-            embeddata.embed(documents)
-
-            qdrant_vdb = QdrantVDB_QB(
-                collection_name=new_collection_name,
-                batch_size=batch_size,
-                vector_dim=1024
-            )
-            qdrant_vdb.define_client()
-            qdrant_vdb.create_collection()
-            qdrant_vdb.ingest_data(embeddata=embeddata)
-
-            retriever = Retriever(vector_db=qdrant_vdb, embeddata=embeddata)
-            query_engine = RAG(retriever=retriever, llm_name="Meta-Llama-3.3-70B-Instruct")
-
-            return query_engine
-    except Exception as e:
-        st.error(f"An error occurred during indexing: {e}")
-        return None
-
-with st.sidebar:
-    st.header("Collection Management")
-    
-    # Get existing collections
-    existing_collections = get_existing_collections()
-    
-    # Collection selection/creation
-    collection_mode = st.radio(
-        "Choose collection mode:",
-        ["Use Existing Collection", "Create New Collection"],
-        index=1 if not existing_collections else 0
+    llm = ChatSambaNovaCloud(
+        model="Meta-Llama-3.1-8B-Instruct",
+        max_tokens=1024,
+        temperature=0.7,
+        top_p=0.01,
     )
-    
-    if collection_mode == "Use Existing Collection":
-        if existing_collections:
-            selected_collection = st.selectbox(
-                "Select existing collection",
-                existing_collections
-            )
 
-            if selected_collection and selected_collection != st.session_state.get('selected_collection'):
-                st.session_state.selected_collection = selected_collection
-                query_engine = initialize_existing_collection(selected_collection)
-                if query_engine:
-                    st.session_state.file_cache[f"{session_id}-{selected_collection}"] = query_engine
-                    st.success(f"Connected to collection: {selected_collection} and ready to chat!")
-                    reset_chat()
+    template = """<|im_start|>system
+    Anda adalah asisten profesional yang membantu menjawab pertanyaan berdasarkan dokumen atau informasi yang diberikan. Analisis Anda harus logis, akurat, dan sesuai dengan konteks yang relevan. Pastikan jawaban Anda didukung oleh referensi yang jelas dari dokumen yang tersedia.
 
-            # Allow uploading files to the existing collection
-            uploaded_file = st.file_uploader("Upload additional `.pdf` file to this collection", type="pdf")
+    **Petunjuk:**
+    1. Gunakan informasi yang relevan dari dokumen yang diberikan untuk menjawab pertanyaan.
+    2. Jawab dengan bahasa sehari-hari yang mudah dipahami.
+    3. Output hanya dalam bentuk JSON dengan format berikut:
+       {{"answer": "Jawaban langsung berdasarkan dokumen"}} jangan sertakan apapun
+    4. Jika tidak ada informasi yang relevan, jawab dengan "Tidak ada informasi yang relevan".
 
-            if uploaded_file:
-                # Display a button for uploading the file to the selected collection
-                if st.button("Upload Document to Existing Collection"):
-                    if selected_collection:
-                        with st.spinner("Adding document to the existing collection..."):
-                            updated_engine = index_documents(uploaded_file, selected_collection)
-                            if updated_engine:
-                                st.session_state.file_cache[f"{session_id}-{selected_collection}"] = updated_engine
-                                st.success(f"Successfully added the document to collection: {selected_collection}!")
-                    else:
-                        st.warning("Please select a collection before uploading a file.")
+    **Konteks:**
+    {data}
 
-        else:
-            st.warning("No collections found. Please create a new collection.")
+    **Pertanyaan:**
+    {user_question}
+    <|im_start|>assistant
+    <|im_end|>
+    """
 
-    if collection_mode == "Create New Collection":
-        new_collection_name = st.text_input("Enter new collection name")
-        
-        if new_collection_name in existing_collections:
-            st.error("Collection name already exists!")
+    prompt = PromptTemplate.from_template(template)
+    chain = prompt | llm | StrOutputParser()
 
-        uploaded_file = st.file_uploader("Choose your `.pdf` file", type="pdf")
+    return chain.stream({
+        "data": format_context(data),
+        "user_question": user_question
+    })
 
-        if uploaded_file:
-            st.session_state.uploaded_file = uploaded_file
+# Helper functions
+def format_context(data):
+    return "\n".join([str(item) for item in data])
+
+def extract_answer_from_json(text: str) -> str:
+    """Extract the answer field from JSON response"""
+    try:
+        # Accumulate JSON text until we have a valid JSON object
+        json_text = ""
+        for char in text:
+            json_text += char
+            try:
+                data = json.loads(json_text)
+                if "answer" in data:
+                    return data["answer"]
+            except json.JSONDecodeError:
+                continue
+        return text  # Return original text if no valid JSON found
+    except Exception as e:
+        print(f"Error extracting answer from JSON: {e}")
+        return text
+
+# Streamlit Chatbot App
+def main():
+    st.title("QnA Retrieval Chatbot")
+    st.write("Ask me anything, and I'll retrieve the best answer for you!")
+
+    # Load models at startup using Streamlit's caching
+    with st.spinner("Loading models..."):
+        dense_model, sparse_model, tokenizer = load_models()
+        # Connect to Milvus
+        connections.connect("default", host=milvus_host, port=milvus_port)
+        st.session_state.models_loaded = True
+
+    # Initialize chat history
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
+    # Display chat messages
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    # User input
+    if user_question := st.chat_input("Ask your question:"):
+        # Add user message to chat history
+        st.session_state.messages.append({"role": "user", "content": user_question})
+        with st.chat_message("user"):
+            st.markdown(user_question)
+
+        # Perform hybrid search with pre-loaded models
+        with st.spinner("Searching for the best answer..."):
+            results = hybrid_search(user_question, dense_model, sparse_model, tokenizer)
+            data = [item['embedding_raw'] for item in results]
+
+        # Stream the final answer
+        with st.chat_message("assistant"):
+            response_placeholder = st.empty()
+            json_accumulator = ""
             
-        if new_collection_name and new_collection_name not in existing_collections and uploaded_file:
-            if st.button("Start Uploading"):
-                with st.spinner("Uploading documents..."):
-                    query_engine = index_documents(uploaded_file, new_collection_name)
-                    
-                    if query_engine:
-                        file_key = f"{session_id}-{new_collection_name}"
-                        st.session_state.file_cache[file_key] = query_engine
-                        st.session_state.selected_collection = new_collection_name
-                        st.success("Successfully uploaded your documents and ready to chat!")
-                        reset_chat()
-
-
-
-# Rest of the chat interface code
-col1, col2 = st.columns([6, 1])
-
-with col1:
-    st.header(f"Tanya jawab dengan dokumen Anda!")
-
-with col2:
-    st.button("Clear ↺", on_click=reset_chat)
-
-if "messages" not in st.session_state:
-    reset_chat()
-
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-
-if prompt := st.chat_input("Masukkan pertanyaan Anda..."):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
-
-    with st.chat_message("assistant"):
-        message_placeholder = st.empty()
-        full_response = ""
-        
-        if st.session_state.selected_collection:
-            file_key = f"{session_id}-{st.session_state.selected_collection}"
-            query_engine = st.session_state.file_cache.get(file_key)
+            for chunk in process_question(user_question, data):
+                json_accumulator += chunk
+                # Try to extract answer from accumulated JSON
+                answer = extract_answer_from_json(json_accumulator)
+                response_placeholder.markdown(answer + "▌")
             
-            if query_engine:
-                streaming_response = query_engine.query(prompt)
-                
-                for chunk in streaming_response:
-                    try:
-                        new_text = chunk.raw["choices"][0]["delta"]["content"]
-                        full_response += new_text
-                        message_placeholder.markdown(full_response + "▌")
-                    except:
-                        pass
+            # Final extraction attempt
+            final_answer = extract_answer_from_json(json_accumulator)
+            response_placeholder.markdown(final_answer)
+            
+            # Add assistant message to chat history with extracted answer
+            st.session_state.messages.append({"role": "assistant", "content": final_answer})
 
-                message_placeholder.markdown(full_response)
-            else:
-                message_placeholder.error("Please select or create a collection first.")
-        else:
-            message_placeholder.error("Please select or create a collection first.")
-
-    st.session_state.messages.append({"role": "assistant", "content": full_response})
+if __name__ == "__main__":
+    main()

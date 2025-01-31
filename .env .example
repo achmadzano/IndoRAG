@@ -1,1 +1,1 @@
-SAMBANOVA_API_KEY="your-sambanova-api-key"
+export SAMBANOVA_API_KEY="your-sambanova-api-key"
